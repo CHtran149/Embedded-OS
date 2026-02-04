@@ -32,11 +32,12 @@ git checkout 1_37_stable
 - Sử dụng nhán 1.37.x stable.
 
 ## 4. Cấu hình BusyBox (stactic - bước khởi đầu)
-### 4.1. Copy file cấu hình mẫu (nếu có)
+### 4.1. Export biến môi trường và toolchain
 ```
-cp ../data/busybox.config .config
+export ARCH=arm
+export CROSS_COMPILE=arm-training-linux-musleabihf-
+export PATH=$HOME/x-tools/arm-training-linux-musleabihf/bin:$PATH
 ```
-- File .config là cấu hình chính thức của BusyBox
 
 ### 4.2. Cấu hình BusyBox
 ```
