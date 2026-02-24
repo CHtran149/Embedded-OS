@@ -171,3 +171,5 @@ LABEL linux
 ## Kết quả cuối cùng khi boot trong BBB
 ![Kết quả cuối cùng](images/3.Boot_1.jpg)
 ![Kết quả cuối cùng](images/4.Boot_2.jpg)
+## Vi trong BBB
+![Kết quả cuối cùng](images/5.vi.jpg)
