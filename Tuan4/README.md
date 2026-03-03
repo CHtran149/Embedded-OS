@@ -115,7 +115,7 @@ sudo cp hello_g5 /media/chien/rootfs/usr/bin/
 ```
 - Cấp quyền thực thi (nếu cần)
 ```
-sudo chmod +x /media/chien/rootfs/usr/bin/hello_manual
+sudo chmod +x /media/chien/rootfs/usr/bin/hello_g5
 ```
 ### 4. Chạy thử lệnh trên BBB
 - Chạy lệnh:
