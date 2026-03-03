@@ -84,7 +84,47 @@ label beaglebone-buildroot
 ## Kết quả thu được sau khi boot hệ điều hành này trên BeagleBone Black
 ![Kết quả cuối cùng](images/2.buildroot_OS.jpg)
 
-## C. Tích hợp ứng dụng tùy biến
+## C. Sử dụng toolchain từ buildroot
+
+### 1. Tạo mã nguồn C trên máy host
+- Tạo thư mục và file .c bằng câu lệnh
+
+
+```
+mkdir ~/bai_tap_02
+cd ~/bai_tap_02
+vi hello_g5.c
+```
+
+### 2. Sử dụng toolchain của buildroot để biên dịch 
+
+- Đường dẫn chính xác thường là: `~/buildroot/buildroot/output/host/bin/arm-buildroot-linux-gnueabihf-gcc`
+- Sử dụng câu lệnh
+
+```
+~/buildroot/buildroot/output/host/bin/arm-buildroot-linux-gnueabihf-gcc -o hello_g5 hello_g5.c
+```
+
+### 3. Đưa chương trình vào RootFS trên thẻ nhớ
+
+- Gắn thẻ nhớ (Mount): Ubuntu thường tự mount vào `/media/chien/rootfs` (hoặc tên tương tự).
+- Copy file thực thi:
+```
+  # Copy file 'hello_g5' vừa tạo vào thư mục /usr/bin trên thẻ nhớ
+sudo cp hello_g5 /media/chien/rootfs/usr/bin/
+```
+- Cấp quyền thực thi (nếu cần)
+```
+sudo chmod +x /media/chien/rootfs/usr/bin/hello_manual
+```
+### 4. Chạy thử lệnh trên BBB
+- Chạy lệnh:
+  ```
+  hello_g5
+  ```
+
+
+## D. Tích hợp ứng dụng tùy biến
 
 ### 1. Tạo cấu trúc thư mục
 ```
