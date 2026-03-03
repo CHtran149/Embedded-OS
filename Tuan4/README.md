@@ -123,6 +123,10 @@ sudo chmod +x /media/chien/rootfs/usr/bin/hello_manual
   hello_g5
   ```
 
+### Kết quả thu được
+![Kết quả cuối cùng](images/4.Toolchain_Buildroot.jpg)
+
+
 
 ## D. Tích hợp ứng dụng tùy biến
 
