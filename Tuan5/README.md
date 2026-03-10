@@ -364,3 +364,5 @@ sync
   - Thu được kết quả:
 
 ![Kết quả cuối cùng](images/3.1.KQCC.jpg)
+
+
