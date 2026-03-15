@@ -350,4 +350,18 @@ sync
   - init thực thi các script trong */etc/init.d/* theo thứ tự.
   - Khi đến lượt *S99led-app*, nó sẽ chạy lệnh *modprobe led_driver* và khởi chạy **led-app** ở chế độ background.
 
+- Xem tiến trình đang chạy, dùng lệnh: `ps | grep led-app`
+
+- Kiểm tra trạng thái driver: `lsmod | grep led_driver`
+
+- Tạng dừng ứng dụng, giữ driver: `killall led-app`. Để quay lại chạy 2 bài 1 và bài 2 thì dùng lệnh này để dừng app và giữ driver.
+
+- Khởi động lại sau khi đã dừng: `/etc/init.d/S99led-app start`
+  
+
+- Dừng chương trình dùng lệnh:
+```
+/etc/init.d/S99led-app stop
+```
+![Kết quả cuối cùng](images/3.Check_Auto_Blynk_Led.jpg)
 [![Watch the video](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://youtube.com/shorts/PvNTXNg-HDw?feature=share)
