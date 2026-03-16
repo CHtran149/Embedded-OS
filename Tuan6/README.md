@@ -87,7 +87,6 @@ static void __exit led_driver_exit(void) {
     gpio_set_value(GPIO_LED, 0);
     gpio_free(GPIO_LED);
     device_destroy(led_class, MKDEV(major_number, 0));
-    class_unregister(led_class);
     class_destroy(led_class);
     unregister_chrdev(major_number, DEVICE_NAME);
     printk(KERN_INFO "LED Driver Unloaded\n");
@@ -187,7 +186,7 @@ clean:
         rm -f led-app
 ```
 
-- Nội dung file led_driver.c: `vi led_driver.c`
+- Nội dung file main.c: `vi main.c`
 ```
 #include <stdio.h>
 #include <stdlib.h>
