@@ -1,0 +1,5 @@
+config BR2_PACKAGE_PZEM_DRIVER
+	bool "pzem_driver"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Kernel Driver cho PZEM-004T su dung Serdev (BTL).

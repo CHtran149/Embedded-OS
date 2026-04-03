@@ -1,0 +1,10 @@
+config BR2_PACKAGE_BTL
+	bool "btl-power-monitor"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  Ứng dụng giám sát điện năng sử dụng PZEM-004T (UART1) 
+	  và hiển thị lên OLED SSD1306 (I2C2).
+	  Yêu cầu Driver pzem_driver và ssd1306_driver.
+
+comment "BTL app needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS

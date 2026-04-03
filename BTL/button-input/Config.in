@@ -1,0 +1,5 @@
+config BR2_PACKAGE_BUTTON_INPUT
+	bool "button-input"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Kernel module for button using Input Subsystem on BBB.

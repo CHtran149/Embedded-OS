@@ -1,0 +1,5 @@
+config BR2_PACKAGE_SSD1306_DRIVER
+	bool "ssd1306_driver"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Linux Kernel Module for SSD1306 OLED Display via I2C.
