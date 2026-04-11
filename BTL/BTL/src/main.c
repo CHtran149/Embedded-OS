@@ -23,14 +23,27 @@
 pthread_mutex_t data_lock = PTHREAD_MUTEX_INITIALIZER;
 char pzem_data[128] = "Loading...";
 
-float thresholds[] = {10.0, 30.0, 50.0, 100.0, 200.0}; // Các mức ngưỡng bạn muốn
-int threshold_index = 0; // Chỉ số hiện tại trong mảng
-float power_threshold = 10.0; // Ngưỡng công suất mặc định (100W)
+float thresholds[] = {10.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0}; 
+int threshold_index = 0; 
+float power_threshold = 10.0;
 int is_overloaded = 0;         // Cờ báo quá tải
 int fd_oled = -1;
 SSD1306_Name myOLED;
 // Biến lưu dữ liệu thô để gửi qua MQTT
 char mqtt_payload[256];
+struct mosquitto *global_mosq = NULL; // Thêm dòng này
+
+void update_oled_display(float limit) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Limit:%.0fW", limit);
+    
+    // Vẽ đè lên dòng thứ 4 của OLED
+    SSD1306_GotoXY(&myOLED, 0, 48);
+    SSD1306_Puts(&myOLED, "                ", &Font_7x10, SSD1306_COLOR_WHITE); // Xóa dòng cũ
+    SSD1306_GotoXY(&myOLED, 0, 48);
+    SSD1306_Puts(&myOLED, buf, &Font_7x10, SSD1306_COLOR_WHITE);
+    SSD1306_UpdateScreen(&myOLED);
+}
 
 // --- Luồng 1: Đọc từ Driver PZEM ---
 void* thread_read_pzem(void* arg) {
@@ -46,7 +59,8 @@ void* thread_read_pzem(void* arg) {
                     if(buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
                 }
                 pthread_mutex_lock(&data_lock);
-                strncpy(pzem_data, buf, sizeof(pzem_data));
+                strncpy(pzem_data, buf, sizeof(pzem_data) - 1);
+                pzem_data[sizeof(pzem_data) - 1] = '\0'; // Đảm bảo luôn có điểm kết thúc
                 pthread_mutex_unlock(&data_lock);
             }
             close(fd);
@@ -142,33 +156,65 @@ void* thread_led_blink(void* arg) {
 }
 
 void* thread_button_handler(void* arg) {
-    int fd_btn = open("/dev/input/event1", O_RDONLY); // Đảm bảo đúng event1 như bạn đã test
+    int fd_btn = open(BUTTON_DEVICE, O_RDONLY);
     struct input_event ev;
     int num_thresholds = sizeof(thresholds) / sizeof(thresholds[0]);
 
     if (fd_btn < 0) {
-        perror("Lỗi mở Button device");
-        return NULL;
+        // Dự phòng nếu udev chưa tạo kịp symlink
+        fd_btn = open("/dev/input/event1", O_RDONLY);
+        if (fd_btn < 0) {
+            perror("Lỗi nghiêm trọng: Không mở được thiết bị nút nhấn");
+            return NULL;
+        }
     }
 
-    printf("Luồng Button sẵn sàng (Dùng mảng xoay vòng %d mức)\n", num_thresholds);
+    printf("Luồng 2 Button sẵn sàng. Ngưỡng hiện tại: %.0fW\n", power_threshold);
 
     while(1) {
-        if (read(fd_btn, &ev, sizeof(struct input_event)) > 0) {
-            // Chỉ xử lý khi nhấn xuống (value == 1)
-            if (ev.type == EV_KEY && ev.code == KEY_A && ev.value == 1) {
-                
-                pthread_mutex_lock(&data_lock);
-                
-                // Tăng chỉ số và xoay vòng bằng toán tử %
-                threshold_index = (threshold_index + 1) % num_thresholds;
-                power_threshold = thresholds[threshold_index];
-                
-                pthread_mutex_unlock(&data_lock);
-                
-                printf("Nút nhấn OK! Chỉ số: %d, Ngưỡng mới: %.0fW\n", 
-                        threshold_index, power_threshold);
+        ssize_t n = read(fd_btn, &ev, sizeof(struct input_event));
+        if (n < (ssize_t)sizeof(struct input_event)) {
+            if (n < 0) perror("Lỗi đọc event nút nhấn");
+            continue; // Đọc lại nếu có lỗi nhỏ hoặc không đủ dữ liệu
+        }
+        
+        // ev.value == 1: Nhấn xuống (đã được Driver debounce)
+        if (ev.type == EV_KEY && ev.value == 1) {
+            
+            pthread_mutex_lock(&data_lock);
+            
+            if (ev.code == KEY_UP) { // Mã KEY_UP từ Driver mới của bạn
+                if (threshold_index < num_thresholds - 1) {
+                    threshold_index++;
+                } else {
+                    printf("-> [MAX] ");
+                }
+            } 
+            else if (ev.code == KEY_DOWN) { // Mã KEY_DOWN
+                if (threshold_index > 0) {
+                    threshold_index--;
+                } else {
+                    printf("-> [MIN] ");
+                }
             }
+
+            power_threshold = thresholds[threshold_index];
+            float current_val = power_threshold; // Copy giá trị ra để dùng ngoài lock
+            
+            pthread_mutex_unlock(&data_lock);
+            
+            // 1. Đồng bộ lên Cloud ngay lập tức
+            if (global_mosq != NULL) {
+                char payload[16];
+                snprintf(payload, sizeof(payload), "%.1f", current_val);
+                mosquitto_publish(global_mosq, NULL, "pzem/config/status", strlen(payload), payload, 0, false);
+            }
+
+            // 2. Cập nhật OLED ngay lập tức (Rất quan trọng)
+            // Gọi hàm vẽ OLED của bạn ở đây
+            update_oled_display(current_val); 
+
+            printf("Nút nhấn OK! Ngưỡng mới: %.0fW (Index: %d)\n", current_val, threshold_index);
         }
     }
     close(fd_btn);
@@ -195,75 +241,62 @@ void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto_messag
 }
 
 void* thread_mqtt(void* arg) {
-    struct mosquitto *mosq = NULL;
     int rc;
 
     // 1. Khởi tạo thư viện
     mosquitto_lib_init();
 
     // Tạo client ID duy nhất
-    mosq = mosquitto_new("BBB_Chien_Device_ID_999@@@@", true, NULL);
-    if (!mosq) {
+    // Trong thread_mqtt, sau khi mosquitto_new:
+    global_mosq = mosquitto_new("BBB_Chien_Device_ID_999@@@@", true, NULL);
+    if (!global_mosq) {
         printf("MQTT: Khong the tao instance!\n");
         return NULL;
     }
 
-    // 2. Đăng ký hàm callback xử lý tin nhắn đến
-    mosquitto_message_callback_set(mosq, on_message);
+    mosquitto_message_callback_set(global_mosq, on_message);
 
-    // 3. Thiết lập bảo mật TLS (Phải có file .crt trên BBB)
-    // if (mosquitto_tls_set(mosq, "/etc/ssl/certs/ca-certificates.crt", NULL, NULL, NULL, NULL) != MOSQ_ERR_SUCCESS) {
-    //     printf("MQTT: Loi thiet lap TLS! Kiem tra file /etc/ssl/certs/ca-certificates.crt\n");
-    // }
-    //mosquitto_tls_insecure_set(mosq, true);
-    // 4. Thiết lập User/Pass
-    mosquitto_username_pw_set(mosq, NULL, NULL);
+    mosquitto_username_pw_set(global_mosq, NULL, NULL);
 
     // 5. Kết nối tới Broker
     printf("MQTT: Dang ket noi den %s...\n", MQTT_HOST);
-    rc = mosquitto_connect(mosq, MQTT_HOST, MQTT_PORT, 60);
-    mosquitto_loop_start(mosq);
+    rc = mosquitto_connect(global_mosq, MQTT_HOST, MQTT_PORT, 60);
+    mosquitto_loop_start(global_mosq);
     if (rc != MOSQ_ERR_SUCCESS) {
         printf("MQTT: Ket noi that bai! Ma loi: %d\n", rc);
-        mosquitto_destroy(mosq);
+        mosquitto_destroy(global_mosq);
         return NULL;
     }
 
-    // 6. KÍCH HOẠT LUỒNG XỬ LÝ MẠNG NGẦM (Sửa lỗi 4 triệt để)
-    //mosquitto_loop_start(mosq);
-
-    // 7. Đăng ký topic nhận cấu hình (pzem/config)
-    mosquitto_subscribe(mosq, NULL, "pzem/config", 0);
+    mosquitto_subscribe(global_mosq, NULL, "pzem/config", 0);
     printf("MQTT: Da ket noi va dang lang nghe tren topic 'pzem/config'\n");
 
     sleep(2);
     // 8. Vòng lặp gửi dữ liệu định kỳ
     while(1) {
+        char local_pzem_copy[128] = "";
+
         pthread_mutex_lock(&data_lock);
-        
-        // Chỉ gửi khi đã có dữ liệu thực từ PZEM
         if (strcmp(pzem_data, "Loading...") != 0) {
-            // Gửi dữ liệu lên topic DATA (pzem/data)
-            int pub_rc = mosquitto_publish(mosq, NULL, "pzem/data", strlen(pzem_data), pzem_data, 0, false);
+            strncpy(local_pzem_copy, pzem_data, sizeof(local_pzem_copy) - 1);
+        }
+        pthread_mutex_unlock(&data_lock); // MỞ KHÓA NGAY LẬP TỨC
+
+        if (strlen(local_pzem_copy) > 0) {
+            int pub_rc = mosquitto_publish(global_mosq, NULL, "pzem/data", strlen(local_pzem_copy), local_pzem_copy, 0, false);
             
             if (pub_rc != MOSQ_ERR_SUCCESS) {
-                        printf("MQTT: Gui that bai (Ma: %d). Dang thu ket noi lai...\n", pub_rc);
-                        // Nếu lỗi 4, ép thư viện kết nối lại
-                        mosquitto_reconnect(mosq);
-            }else {
-                printf("MQTT: Da gui du lieu len pzem/data\n");
+                printf("MQTT: Loi gui data, dang thu lai...\n");
+                mosquitto_reconnect(global_mosq);
             }
         }
         
-        pthread_mutex_unlock(&data_lock);
-
-        // Gửi mỗi 2 giây để tránh spam Cloud và bị block
-        sleep(5); 
+        sleep(5); // Nghỉ 5 giây trước khi copy lượt tiếp theo
     }
 
     // Dọn dẹp (Lý thuyết vì vòng lặp while(1) chạy mãi)
-    mosquitto_loop_stop(mosq, true);
-    mosquitto_destroy(mosq);
+    mosquitto_loop_stop(global_mosq, true);
+    mosquitto_destroy(global_mosq);
     mosquitto_lib_cleanup();
     return NULL;
 }
