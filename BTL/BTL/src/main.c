@@ -4,217 +4,203 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <mqueue.h>
 #include <linux/input.h>
 #include <mosquitto.h>
+#include <time.h>
 #include "OLED_LCD_SSD1306.h"
 #include "fonts.h"
 
 // --- Cấu hình thiết bị ---
 #define LED_DEVICE "/dev/led_test"
-#define BUTTON_DEVICE "/dev/input/my_button" // Bạn hãy kiểm tra lại eventX bằng lệnh 'cat /proc/bus/input/devices'
+#define BUTTON_DEVICE "/dev/input/my_button"
+
 // --- Cấu hình MQTT ---
-#define MQTT_HOST "broker.emqx.io"//"7ae02c3c05de4372aaf8623029444fd0.s1.eu.hivemq.cloud"
-#define MQTT_PORT 1883 // Bắt buộc dùng 8883 cho HiveMQ Cloud
-#define MQTT_USER NULL//"chien_bbb"
-#define MQTT_PASS NULL//"Chien149@" // Mật khẩu bạn vừa dùng trong ảnh
+#define MQTT_HOST "broker.emqx.io"
+#define MQTT_PORT 1883
 #define MQTT_TOPIC_PUB "pzem/data"
 #define MQTT_TOPIC_SUB "pzem/config"
-// --- Biến toàn cục ---
-pthread_mutex_t data_lock = PTHREAD_MUTEX_INITIALIZER;
-char pzem_data[128] = "Loading...";
 
-float thresholds[] = {10.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0}; 
-int threshold_index = 0; 
-float power_threshold = 10.0;
-int is_overloaded = 0;         // Cờ báo quá tải
+// --- Cấu hình Message Queue ---
+#define QUEUE_LIMIT      "/limit_queue"
+#define MAX_MSG_SIZE    sizeof(float)
+#define MAX_MSGS        10
+#define QUEUE_PZEM_OLED "/pzem_oled_q"
+#define QUEUE_PZEM_MQTT "/pzem_mqtt_q"
+#define MAX_PZEM_STR    128
+
+// --- Biến toàn cục ---
+float current_threshold = 20.0;
+const float STEP = 5.0;
+const float MAX_THRESHOLD = 500.0;
+const float MIN_THRESHOLD = 0.0;
+int is_overloaded = 0;
 int fd_oled = -1;
 SSD1306_Name myOLED;
-// Biến lưu dữ liệu thô để gửi qua MQTT
-char mqtt_payload[256];
-struct mosquitto *global_mosq = NULL; // Thêm dòng này
+struct mosquitto *global_mosq = NULL;
 
-void update_oled_display(float limit) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Limit:%.0fW", limit);
-    
-    // Vẽ đè lên dòng thứ 4 của OLED
-    SSD1306_GotoXY(&myOLED, 0, 48);
-    SSD1306_Puts(&myOLED, "                ", &Font_7x10, SSD1306_COLOR_WHITE); // Xóa dòng cũ
-    SSD1306_GotoXY(&myOLED, 0, 48);
-    SSD1306_Puts(&myOLED, buf, &Font_7x10, SSD1306_COLOR_WHITE);
-    SSD1306_UpdateScreen(&myOLED);
-}
+mqd_t mq_limit, mq_pzem_oled, mq_pzem_mqtt;
 
-// --- Luồng 1: Đọc từ Driver PZEM ---
+// --- Luồng 1: Đọc từ Driver PZEM (Producer) ---
 void* thread_read_pzem(void* arg) {
-    int fd;
-    char buf[128];
+    char buf[MAX_PZEM_STR];
+    struct timespec ts;
+
     while(1) {
-        fd = open("/dev/pzem_sensor", O_RDONLY);
+        // Bước 1: Mở file
+        int fd = open("/dev/pzem_sensor", O_RDONLY);
         if (fd >= 0) {
             memset(buf, 0, sizeof(buf));
             int n = read(fd, buf, sizeof(buf) - 1);
+            close(fd); 
+
             if (n > 0) {
-                for(int i = 0; i < n; i++) {
-                    if(buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
-                }
-                pthread_mutex_lock(&data_lock);
-                strncpy(pzem_data, buf, sizeof(pzem_data) - 1);
-                pzem_data[sizeof(pzem_data) - 1] = '\0'; // Đảm bảo luôn có điểm kết thúc
-                pthread_mutex_unlock(&data_lock);
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 100000000; // Đợi tối đa 100ms
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+
+                mq_timedsend(mq_pzem_oled, buf, MAX_PZEM_STR, 0, &ts);
+                mq_timedsend(mq_pzem_mqtt, buf, MAX_PZEM_STR, 0, &ts);
             }
-            close(fd);
+        } else {
+            perror("PZEM Open Failed");
         }
+
         usleep(500000); 
     }
     return NULL;
 }
 
-// --- Luồng 2: Hiển thị OLED và Kiểm tra ngưỡng ---
+// --- Luồng 2: Hiển thị OLED (Consumer trung tâm) ---
 void* thread_display_oled(void* arg) {
-    char display_buf[128];
+    char display_buf[MAX_PZEM_STR] = "Loading...";
     char v_raw[16], i_raw[16], p_raw[16], f_raw[16];
     char i_fmt[16], p_fmt[16], limit_fmt[16];
+    float received_limit;
+    float current_display_limit = 10.0; // Giá trị nội bộ
+    struct timespec ts;
 
     while(1) {
-        pthread_mutex_lock(&data_lock);
-        strncpy(display_buf, pzem_data, sizeof(display_buf));
-        pthread_mutex_unlock(&data_lock);
+        // 1. Kiểm tra Queue Ngưỡng (Timeout 10ms - check nhanh)
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 10000000; 
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
 
-        if (sscanf(display_buf, "U: %[^|] | I: %[^|] | P: %[^|] | F: %[^|]", 
-                   v_raw, i_raw, p_raw, f_raw) >= 4) {
-
-            float i_val = atof(i_raw);
-            float p_val = atof(p_raw);
-            
-            // Kiểm tra quá tải
-            is_overloaded = (p_val > power_threshold) ? 1 : 0;
-
-            snprintf(i_fmt, sizeof(i_fmt), "%.2fA", i_val);
-            snprintf(p_fmt, sizeof(p_fmt), "%.2fW", p_val);
-            snprintf(limit_fmt, sizeof(limit_fmt), "Limit:%.0fW", power_threshold);
-
-            SSD1306_Fill(&myOLED, SSD1306_COLOR_BLACK);
-            
-            // Hiển thị Tiêu đề hoặc Cảnh báo
-            SSD1306_GotoXY(&myOLED, 10, 0);
-            if (is_overloaded) {
-                SSD1306_Puts(&myOLED, "!! OVERLOAD !!", &Font_7x10, SSD1306_COLOR_WHITE);
-            } else {
-                SSD1306_Puts(&myOLED, "POWER MONITOR", &Font_7x10, SSD1306_COLOR_WHITE);
-            }
-
-            // Dòng 2: V và I
-            SSD1306_GotoXY(&myOLED, 0, 18);
-            SSD1306_Puts(&myOLED, "V:", &Font_7x10, SSD1306_COLOR_WHITE);
-            SSD1306_GotoXY(&myOLED, 15, 18);
-            SSD1306_Puts(&myOLED, v_raw, &Font_7x10, SSD1306_COLOR_WHITE);
-
-            SSD1306_GotoXY(&myOLED, 65, 18);
-            SSD1306_Puts(&myOLED, "I:", &Font_7x10, SSD1306_COLOR_WHITE);
-            SSD1306_GotoXY(&myOLED, 80, 18);
-            SSD1306_Puts(&myOLED, i_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
-
-            // Dòng 3: P hiện tại
-            SSD1306_GotoXY(&myOLED, 0, 33);
-            SSD1306_Puts(&myOLED, "P:", &Font_7x10, SSD1306_COLOR_WHITE);
-            SSD1306_GotoXY(&myOLED, 15, 33);
-            SSD1306_Puts(&myOLED, p_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
-
-            // Dòng 4: Ngưỡng giới hạn (Dễ theo dõi khi nhấn nút)
-            SSD1306_GotoXY(&myOLED, 0, 48);
-            SSD1306_Puts(&myOLED, limit_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
-
-            SSD1306_UpdateScreen(&myOLED);
+        if (mq_timedreceive(mq_limit, (char*)&received_limit, MAX_MSG_SIZE, NULL, &ts) >= 0) {
+            current_display_limit = received_limit;
+            printf("Display: Cập nhật ngưỡng hiển thị: %.0fW\n", current_display_limit);
         }
-        usleep(300000); 
+
+        // 2. Kiểm tra Queue Dữ liệu PZEM (Timeout 40ms)
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 40000000; 
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+
+        if (mq_timedreceive(mq_pzem_oled, display_buf, MAX_PZEM_STR, NULL, &ts) >= 0) {
+            // Chỉ vẽ khi nhận được dữ liệu PZEM mới
+            if (sscanf(display_buf, "U: %[^|] | I: %[^|] | P: %[^|] | F: %[^|]", 
+                       v_raw, i_raw, p_raw, f_raw) >= 4) {
+
+                float p_val = atof(p_raw);
+                is_overloaded = (p_val > current_display_limit) ? 1 : 0;
+
+                snprintf(i_fmt, sizeof(i_fmt), "%.2fA", atof(i_raw));
+                snprintf(p_fmt, sizeof(p_fmt), "%.2fW", p_val);
+                snprintf(limit_fmt, sizeof(limit_fmt), "Limit:%.0fW", current_display_limit);
+
+                SSD1306_Fill(&myOLED, SSD1306_COLOR_BLACK);
+                
+                SSD1306_GotoXY(&myOLED, 10, 0);
+                if (is_overloaded) {
+                    SSD1306_Puts(&myOLED, "!! OVERLOAD !!", &Font_7x10, SSD1306_COLOR_WHITE);
+                } else {
+                    SSD1306_Puts(&myOLED, "POWER MONITOR", &Font_7x10, SSD1306_COLOR_WHITE);
+                }
+
+                SSD1306_GotoXY(&myOLED, 0, 18);
+                SSD1306_Puts(&myOLED, "V:", &Font_7x10, SSD1306_COLOR_WHITE);
+                SSD1306_GotoXY(&myOLED, 15, 18);
+                SSD1306_Puts(&myOLED, v_raw, &Font_7x10, SSD1306_COLOR_WHITE);
+
+                SSD1306_GotoXY(&myOLED, 65, 18);
+                SSD1306_Puts(&myOLED, "I:", &Font_7x10, SSD1306_COLOR_WHITE);
+                SSD1306_GotoXY(&myOLED, 80, 18);
+                SSD1306_Puts(&myOLED, i_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
+
+                SSD1306_GotoXY(&myOLED, 0, 33);
+                SSD1306_Puts(&myOLED, "P:", &Font_7x10, SSD1306_COLOR_WHITE);
+                SSD1306_GotoXY(&myOLED, 15, 33);
+                SSD1306_Puts(&myOLED, p_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
+
+                SSD1306_GotoXY(&myOLED, 0, 48);
+                SSD1306_Puts(&myOLED, limit_fmt, &Font_7x10, SSD1306_COLOR_WHITE);
+
+                SSD1306_UpdateScreen(&myOLED);
+            }
+        }
+        usleep(100000); 
     }
     return NULL;
 }
 
-// --- Luồng 3: Điều khiển LED nhấp nháy ---
+// --- Luồng 3: Điều khiển LED (Chỉ đọc cờ is_overloaded) ---
 void* thread_led_blink(void* arg) {
     int fd_led = open(LED_DEVICE, O_WRONLY);
-    if (fd_led < 0) {
-        perror("Lỗi mở LED device");
-        return NULL;
-    }
+    if (fd_led < 0) return NULL;
 
     while(1) {
         if (is_overloaded) {
-            write(fd_led, "1", 1);
-            usleep(200000);
-            write(fd_led, "0", 1);
-            usleep(200000);
+            write(fd_led, "1", 1); usleep(200000);
+            write(fd_led, "0", 1); usleep(200000);
         } else {
-            write(fd_led, "0", 1);
-            usleep(500000);
+            write(fd_led, "0", 1); usleep(500000);
         }
     }
     close(fd_led);
     return NULL;
 }
 
+// --- Luồng 4: Nút nhấn (Producer) ---
 void* thread_button_handler(void* arg) {
-    int fd_btn = open(BUTTON_DEVICE, O_RDONLY);
+    int fd_btn = open("/dev/input/event1", O_RDONLY);
     struct input_event ev;
-    int num_thresholds = sizeof(thresholds) / sizeof(thresholds[0]);
 
     if (fd_btn < 0) {
-        // Dự phòng nếu udev chưa tạo kịp symlink
-        fd_btn = open("/dev/input/event1", O_RDONLY);
-        if (fd_btn < 0) {
-            perror("Lỗi nghiêm trọng: Không mở được thiết bị nút nhấn");
-            return NULL;
-        }
+        perror("Lỗi: Không thể mở /dev/input/event1");
+        return NULL;
     }
 
-    printf("Luồng 2 Button sẵn sàng. Ngưỡng hiện tại: %.0fW\n", power_threshold);
-
     while(1) {
-        ssize_t n = read(fd_btn, &ev, sizeof(struct input_event));
-        if (n < (ssize_t)sizeof(struct input_event)) {
-            if (n < 0) perror("Lỗi đọc event nút nhấn");
-            continue; // Đọc lại nếu có lỗi nhỏ hoặc không đủ dữ liệu
-        }
-        
-        // ev.value == 1: Nhấn xuống (đã được Driver debounce)
-        if (ev.type == EV_KEY && ev.value == 1) {
-            
-            pthread_mutex_lock(&data_lock);
-            
-            if (ev.code == KEY_UP) { // Mã KEY_UP từ Driver mới của bạn
-                if (threshold_index < num_thresholds - 1) {
-                    threshold_index++;
-                } else {
-                    printf("-> [MAX] ");
+        if (read(fd_btn, &ev, sizeof(struct input_event)) > 0) {
+            // Chỉ xử lý khi có sự kiện nhấn phím (value == 1)
+            if (ev.type == EV_KEY && ev.value == 1) {
+                
+                if (ev.code == KEY_UP) {
+                    // Kiểm tra nếu cộng thêm STEP vẫn chưa vượt MAX thì mới cộng
+                    if (current_threshold + STEP <= MAX_THRESHOLD) {
+                        current_threshold += STEP;
+                        printf("[Nút UP] Ngưỡng tăng: %.1fW\n", current_threshold);
+                    } else {
+                        current_threshold = MAX_THRESHOLD; // Ép về MAX
+                        printf("[Nút UP] Đã đạt giới hạn tối đa: %.1fW\n", MAX_THRESHOLD);
+                    }
+                } 
+                else if (ev.code == KEY_DOWN) {
+                    // Kiểm tra nếu trừ đi STEP vẫn không bé hơn MIN thì mới trừ
+                    if (current_threshold - STEP >= MIN_THRESHOLD) {
+                        current_threshold -= STEP;
+                        printf("[Nút DOWN] Ngưỡng giảm: %.1fW\n", current_threshold);
+                    } else {
+                        current_threshold = MIN_THRESHOLD; // Ép về MIN
+                        printf("[Nút DOWN] Đã đạt giới hạn tối thiểu: %.1fW\n", MIN_THRESHOLD);
+                    }
                 }
-            } 
-            else if (ev.code == KEY_DOWN) { // Mã KEY_DOWN
-                if (threshold_index > 0) {
-                    threshold_index--;
-                } else {
-                    printf("-> [MIN] ");
+
+                // Gửi giá trị ngưỡng mới vào Message Queue
+                if (mq_send(mq_limit, (const char*)&current_threshold, sizeof(current_threshold), 0) == -1) {
+                    perror("Lỗi mq_send trong luồng nút nhấn");
                 }
             }
-
-            power_threshold = thresholds[threshold_index];
-            float current_val = power_threshold; // Copy giá trị ra để dùng ngoài lock
-            
-            pthread_mutex_unlock(&data_lock);
-            
-            // 1. Đồng bộ lên Cloud ngay lập tức
-            if (global_mosq != NULL) {
-                char payload[16];
-                snprintf(payload, sizeof(payload), "%.1f", current_val);
-                mosquitto_publish(global_mosq, NULL, "pzem/config/status", strlen(payload), payload, 0, false);
-            }
-
-            // 2. Cập nhật OLED ngay lập tức (Rất quan trọng)
-            // Gọi hàm vẽ OLED của bạn ở đây
-            update_oled_display(current_val); 
-
-            printf("Nút nhấn OK! Ngưỡng mới: %.0fW (Index: %d)\n", current_val, threshold_index);
         }
     }
     close(fd_btn);
@@ -225,85 +211,51 @@ void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto_messag
     if (msg->payloadlen > 0) {
         char temp_buf[32];
         int len = (msg->payloadlen < 31) ? msg->payloadlen : 31;
-        
         memcpy(temp_buf, msg->payload, len);
-        temp_buf[len] = '\0'; // Đảm bảo là một chuỗi hợp lệ
+        temp_buf[len] = '\0';
         
         float new_limit = atof(temp_buf);
-        
         if (new_limit > 0) {
-            pthread_mutex_lock(&data_lock);
-            power_threshold = new_limit;
-            pthread_mutex_unlock(&data_lock);
-            printf("MQTT: Da nhan nguong moi tu Cloud: %.1f W\n", new_limit);
+            // Gửi vào chung Queue với Button
+            mq_send(mq_limit, (const char*)&new_limit, sizeof(new_limit), 0);
+            printf("MQTT: Đã đẩy ngưỡng %.1f vào Queue\n", new_limit);
         }
     }
 }
 
 void* thread_mqtt(void* arg) {
-    int rc;
+    char mqtt_buf[MAX_PZEM_STR];
+    struct timespec ts;
 
-    // 1. Khởi tạo thư viện
     mosquitto_lib_init();
-
-    // Tạo client ID duy nhất
-    // Trong thread_mqtt, sau khi mosquitto_new:
-    global_mosq = mosquitto_new("BBB_Chien_Device_ID_999@@@@", true, NULL);
-    if (!global_mosq) {
-        printf("MQTT: Khong the tao instance!\n");
-        return NULL;
-    }
-
+    global_mosq = mosquitto_new("BBB_Chien_Task", true, NULL);
     mosquitto_message_callback_set(global_mosq, on_message);
-
-    mosquitto_username_pw_set(global_mosq, NULL, NULL);
-
-    // 5. Kết nối tới Broker
-    printf("MQTT: Dang ket noi den %s...\n", MQTT_HOST);
-    rc = mosquitto_connect(global_mosq, MQTT_HOST, MQTT_PORT, 60);
+    
+    if (mosquitto_connect(global_mosq, MQTT_HOST, MQTT_PORT, 60) != MOSQ_ERR_SUCCESS) return NULL;
+    mosquitto_subscribe(global_mosq, NULL, MQTT_TOPIC_SUB, 0);
+    
+    // Chạy loop trong thread riêng của thư viện để luôn sẵn sàng nhận tin (Subscribe)
     mosquitto_loop_start(global_mosq);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        printf("MQTT: Ket noi that bai! Ma loi: %d\n", rc);
-        mosquitto_destroy(global_mosq);
-        return NULL;
-    }
 
-    mosquitto_subscribe(global_mosq, NULL, "pzem/config", 0);
-    printf("MQTT: Da ket noi va dang lang nghe tren topic 'pzem/config'\n");
-
-    sleep(2);
-    // 8. Vòng lặp gửi dữ liệu định kỳ
     while(1) {
-        char local_pzem_copy[128] = "";
-
-        pthread_mutex_lock(&data_lock);
-        if (strcmp(pzem_data, "Loading...") != 0) {
-            strncpy(local_pzem_copy, pzem_data, sizeof(local_pzem_copy) - 1);
+        // Đợi dữ liệu PZEM dành riêng cho MQTT
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000000; // Đợi tối đa 500ms
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
         }
-        pthread_mutex_unlock(&data_lock); // MỞ KHÓA NGAY LẬP TỨC
 
-        if (strlen(local_pzem_copy) > 0) {
-            int pub_rc = mosquitto_publish(global_mosq, NULL, "pzem/data", strlen(local_pzem_copy), local_pzem_copy, 0, false);
-            
-            if (pub_rc != MOSQ_ERR_SUCCESS) {
-                printf("MQTT: Loi gui data, dang thu lai...\n");
-                mosquitto_reconnect(global_mosq);
-            }
+        if (mq_timedreceive(mq_pzem_mqtt, mqtt_buf, MAX_PZEM_STR, NULL, &ts) >= 0) {
+            mosquitto_publish(global_mosq, NULL, MQTT_TOPIC_PUB, strlen(mqtt_buf), mqtt_buf, 0, false);
         }
-        
-        sleep(5); // Nghỉ 5 giây trước khi copy lượt tiếp theo
     }
-
-    // Dọn dẹp (Lý thuyết vì vòng lặp while(1) chạy mãi)
-    mosquitto_loop_stop(global_mosq, true);
-    mosquitto_destroy(global_mosq);
-    mosquitto_lib_cleanup();
     return NULL;
 }
 
 // --- Hàm Main ---
 int main() {
-    pthread_t t1, t2, t3, t4, t5;//t5
+    pthread_t t1, t2, t3, t4, t5;
 
     fd_oled = open("/dev/oled_ssd1306", O_WRONLY);
     if (fd_oled < 0) {
@@ -320,6 +272,14 @@ int main() {
     SSD1306_Fill(&myOLED, SSD1306_COLOR_BLACK);
     SSD1306_UpdateScreen(&myOLED);
 
+    struct mq_attr attr_f = {0, 10, sizeof(float), 0};
+    struct mq_attr attr_s = {0, 20, MAX_PZEM_STR, 0};
+
+    mq_unlink(QUEUE_LIMIT); mq_unlink(QUEUE_PZEM_OLED); mq_unlink(QUEUE_PZEM_MQTT);
+    mq_limit = mq_open(QUEUE_LIMIT, O_CREAT | O_RDWR, 0644, &attr_f);
+    mq_pzem_oled = mq_open(QUEUE_PZEM_OLED, O_CREAT | O_RDWR, 0644, &attr_s);
+    mq_pzem_mqtt = mq_open(QUEUE_PZEM_MQTT, O_CREAT | O_RDWR, 0644, &attr_s);
+
     // Tạo 4 luồng
     pthread_create(&t1, NULL, thread_read_pzem, NULL);
     pthread_create(&t2, NULL, thread_display_oled, NULL);
@@ -333,6 +293,10 @@ int main() {
     pthread_join(t3, NULL);
     pthread_join(t4, NULL);
     pthread_join(t5, NULL);
+
+    mq_close(mq_limit);
+    mq_close(mq_pzem_oled);
+    mq_close(mq_pzem_mqtt);
 
     close(fd_oled);
     return 0;

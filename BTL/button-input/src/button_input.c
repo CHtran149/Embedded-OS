@@ -46,6 +46,9 @@ static irqreturn_t buttons_isr(int irq, void *dev_id) {
 
 static int __init buttons_init(void) {
     int ret;
+    
+    btn_up.last_jiffies = jiffies - msecs_to_jiffies(50);
+    btn_down.last_jiffies = jiffies - msecs_to_jiffies(50);
 
     // 1. Cấu hình Input Device
     buttons_dev = input_allocate_device();

@@ -1,0 +1,49 @@
+#!/bin/sh
+
+case "$1" in
+  start)
+    echo "--- [1] Dang cau hinh mang cho BBB ---"
+    ifconfig usb0 192.168.7.2 netmask 255.255.255.0 up
+    sleep 2
+    route del default 2>/dev/null
+    route add default gw 192.168.7.1 usb0
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    ifconfig usb0 mtu 1400
+    echo "Mang da san sang!"
+        
+    sleep 1
+
+    echo "--- [2] Dang nap Driver va MQTT App ---"
+    insmod /lib/modules/$(uname -r)/extra/button_input.ko
+    insmod /lib/modules/$(uname -r)/extra/pzem_driver.ko
+    insmod /lib/modules/$(uname -r)/extra/ssd1306_driver.ko
+    insmod /lib/modules/$(uname -r)/extra/led_driver.ko
+
+    sleep 1
+    chmod 666 /dev/input/event1
+
+
+    # Chạy ứng dụng BTL (Chuyển log vào file để debug nếu cần)
+    #/usr/bin/btl_app > /var/log/btl_app.log 2>&1 &
+    #echo "BTL App is running in background..."
+    ;;
+    
+  stop)
+    echo "Dang dung cac dich vu..."
+    killall btl_app 2>/dev/null
+    # Có thể rmmod các driver ở đây nếu muốn hệ thống sạch hoàn toàn
+    ;;
+
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0

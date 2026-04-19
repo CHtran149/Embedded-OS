@@ -1,6 +1,6 @@
 CC ?= gcc
 #
-LIBS = -lmosquitto -lpthread -lm
+LIBS = -lmosquitto -lpthread -lm -lrt
 
 OBJS = main.o OLED_LCD_SSD1306.o fonts.o
 TARGET = btl_app
